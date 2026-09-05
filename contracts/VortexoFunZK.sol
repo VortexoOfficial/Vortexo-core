@@ -15,7 +15,7 @@ interface IGroth16Verifier {
 
 /// @title VortexoFunZK
 /// @notice zk-SNARK privacy protocol: deposit native assets, withdraw to any
-///         address with a zero-knowledge proof. Revert-reason prefixes are "VF:".
+///         
 contract VortexoFunZK is IncrementalMerkleTree {
     address public owner;
     uint256 public feePercentage = 2;
@@ -37,6 +37,25 @@ contract VortexoFunZK is IncrementalMerkleTree {
     event Withdrawal(address indexed recipient, bytes32 indexed nullifierHash, uint8 denomination, uint256 amount, uint256 fee, address relayer);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event FeeUpdated(uint256 oldFee, uint256 newFee);
+
+    
+    uint256 public constant RELAYER_REGISTRATION_FEE = 0.01 ether;
+    uint8 public constant MAX_FEE_TIER = 3;
+    uint256 public relayerFeesCollected;
+
+    struct Relayer {
+        uint8 feeTier;    
+        string endpoint;  
+        bool active;
+    }
+
+    mapping(address => Relayer) public relayers;
+    address[] private relayerAddresses;
+
+    event RelayerRegistered(address indexed relayer, uint8 feeTier, string endpoint);
+    event RelayerUpdated(address indexed relayer, uint8 feeTier, string endpoint);
+    event RelayerDeactivated(address indexed relayer);
+    event RelayerReactivated(address indexed relayer);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "VF: caller is not owner");
@@ -96,14 +115,28 @@ contract VortexoFunZK is IncrementalMerkleTree {
         uint8 denom
     ) external noReentrancy {
         require(denom >= 1 && denom <= 4, "VF: invalid denomination");
-        
+
         require(isKnownRoot(root, denom), "VF: unknown root");
         require(!nullifierHashes[nullifierHash], "VF: note already spent");
 
         uint256 amount = getDenominationValue(denom);
 
         uint256 netAmount = (amount * (100 - feePercentage)) / 100;
-        require(fee <= netAmount, "VF: fee exceeds amount");
+
+        if (fee == 0) {
+            // Self-withdrawal: the user submits the proof themselves, pays gas
+            // directly, and keeps the full net amount. No relayer involved.
+            // (The `relayer` public signal is simply the user's own address.)
+        } else {
+            // Relayer-assisted withdrawal: the fee is the relayer's reward.
+            // Enforce the marketplace rules on-chain — the relayer must be a
+            // registered (0.01 ETH paid) active relayer, and the fee must be
+            // EXACTLY denomination * relayer's tier / 1000. No relayer can
+            // ever charge more than 0.3%, and no user can underpay a tier.
+            require(relayers[relayer].active, "VF: relayer not registered");
+            require(fee == (amount * relayers[relayer].feeTier) / 1000, "VF: invalid relayer fee");
+            require(fee <= netAmount, "VF: fee exceeds amount");
+        }
 
         uint[6] memory publicSignals = [
             root,
@@ -136,6 +169,93 @@ contract VortexoFunZK is IncrementalMerkleTree {
 
     function isSpent(bytes32 nullifierHash) external view returns (bool) {
         return nullifierHashes[nullifierHash];
+    }
+
+  
+
+    /// @notice Register as a relayer. Pays the one-time 0.01 ETH fee to the
+    ///         owner and records the chosen fee tier + server endpoint.
+    /// @param _feeTier 1 = 0.1%, 2 = 0.2%, 3 = 0.3% (maximum allowed).
+    /// @param _endpoint HTTPS URL of this relayer's API server.
+    function registerRelayer(uint8 _feeTier, string calldata _endpoint) external payable noReentrancy {
+        require(msg.value == RELAYER_REGISTRATION_FEE, "VF: registration costs exactly 0.01 ETH");
+        require(_feeTier >= 1 && _feeTier <= MAX_FEE_TIER, "VF: fee tier must be 1-3");
+        require(!relayers[msg.sender].active, "VF: already registered");
+        require(bytes(_endpoint).length > 0, "VF: endpoint required");
+
+        relayers[msg.sender] = Relayer({ feeTier: _feeTier, endpoint: _endpoint, active: true });
+        relayerAddresses.push(msg.sender);
+
+        relayerFeesCollected += msg.value;
+
+        emit RelayerRegistered(msg.sender, _feeTier, _endpoint);
+    }
+
+    /// @notice Change your fee tier (e.g. compete for users by lowering it).
+    function updateRelayerFee(uint8 _feeTier) external {
+        require(relayers[msg.sender].active, "VF: not a registered relayer");
+        require(_feeTier >= 1 && _feeTier <= MAX_FEE_TIER, "VF: fee tier must be 1-3");
+        relayers[msg.sender].feeTier = _feeTier;
+        emit RelayerUpdated(msg.sender, _feeTier, relayers[msg.sender].endpoint);
+    }
+
+    /// @notice Update your server endpoint (e.g. after moving to a new host).
+    function updateRelayerEndpoint(string calldata _endpoint) external {
+        require(relayers[msg.sender].active, "VF: not a registered relayer");
+        require(bytes(_endpoint).length > 0, "VF: endpoint required");
+        relayers[msg.sender].endpoint = _endpoint;
+        emit RelayerUpdated(msg.sender, relayers[msg.sender].feeTier, _endpoint);
+    }
+
+    /// @notice Leave the marketplace (keeps your registration, stops appearing active).
+    function deactivateRelayer() external {
+        require(relayers[msg.sender].active, "VF: not a registered relayer");
+        relayers[msg.sender].active = false;
+        emit RelayerDeactivated(msg.sender);
+    }
+
+    /// @notice Come back online without paying again — registration is for life.
+    function reactivateRelayer() external {
+        require(bytes(relayers[msg.sender].endpoint).length > 0, "VF: never registered");
+        require(!relayers[msg.sender].active, "VF: already active");
+        relayers[msg.sender].active = true;
+        emit RelayerReactivated(msg.sender);
+    }
+
+    /// @notice Full list of wallets that have ever registered as relayers.
+    function getRelayers() external view returns (address[] memory) {
+        return relayerAddresses;
+    }
+
+    function getRelayerCount() external view returns (uint256) {
+        return relayerAddresses.length;
+    }
+
+    /// @notice Registry entry for one relayer.
+    /// @return feeTier per-mille tier (1..3)
+    /// @return endpoint the relayer's API server URL
+    /// @return active whether the relayer is currently in the marketplace
+    function getRelayerInfo(address _relayer) external view returns (uint8 feeTier, string memory endpoint, bool active) {
+        Relayer storage r = relayers[_relayer];
+        return (r.feeTier, r.endpoint, r.active);
+    }
+
+    /// @notice The exact fee a given relayer earns for withdrawing a given
+    ///         denomination — the same formula enforced inside withdraw().
+    function getRelayerFeeForDenom(address _relayer, uint8 denom) external view returns (uint256) {
+        require(relayers[_relayer].active, "VF: relayer not registered");
+        require(denom >= 1 && denom <= 4, "VF: invalid denomination");
+        return (getDenominationValue(denom) * relayers[_relayer].feeTier) / 1000;
+    }
+
+    /// @notice Owner withdraws the relayer registration fees accumulated in
+    ///         the contract, at any time.
+    function withdrawRelayerFees() external onlyOwner noReentrancy {
+        uint256 amount = relayerFeesCollected;
+        require(amount > 0, "VF: no relayer fees to withdraw");
+        relayerFeesCollected = 0;
+        (bool sent, ) = owner.call{value: amount}("");
+        require(sent, "VF: fee withdrawal failed");
     }
 
     function transferOwnership(address newOwner) external onlyOwner {
